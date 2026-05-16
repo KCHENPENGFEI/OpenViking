@@ -1,18 +1,28 @@
 """Flat ingest script for the ov_flattern experiment.
 
 Walks the three target novels' markdown files, detects chapters, chunks them,
-and (in dry-run mode) prints the URIs that would be written. The real ingest
-path is added in Task 2.2.
+and writes them flat under viking://resource/. Each chunk goes through
+``VikingFS.write_file`` and is then enqueued to the EMBEDDING queue with a
+``Context`` whose ``level=DETAIL`` and ``abstract=""``.
+
+VLM-driven abstract/overview generation is bypassed entirely: the SemanticQueue
+is never enqueued. At retrieval time there are no L0/L1 records, so the
+hierarchical retriever falls back to pure L2 vector matching.
 
 Usage:
+    # Preview only:
     python scripts/flatten_ingest.py --dry-run
-    python scripts/flatten_ingest.py --dry-run --novels 神雕侠侣
+
+    # Real ingest (requires server running with ov-flattern.conf):
+    python scripts/flatten_ingest.py \
+        --account-id ACC --user-id USR \
+        --novels 神雕侠侣 仙逆 诛仙
 """
 
 import argparse
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from scripts._flatten_chunker import chunk_chapter, locate_chapters
 from scripts._flatten_uri import build_flat_uri
@@ -24,12 +34,42 @@ NOVEL_MAP = {
 }
 
 
+async def _real_ingest_chunk(
+    viking_fs: Any,
+    embedding_queue: Any,
+    *,
+    uri: str,
+    content: str,
+    account_id: str,
+    user_id: str,
+) -> None:
+    """Write one chunk to AGFS and enqueue its embedding."""
+    # Local imports so that unit tests that mock both args don't need the live
+    # OpenViking runtime imported at module-load time.
+    from openviking.core.context import Context, ContextLevel, Vectorize
+    from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
+
+    await viking_fs.write_file(uri, content)
+
+    ctx_obj = Context(
+        uri=uri,
+        level=ContextLevel.DETAIL,
+        is_leaf=True,
+        abstract="",
+        account_id=account_id,
+    )
+    ctx_obj.set_vectorize(Vectorize(text=content))
+    msg = EmbeddingMsgConverter.from_context(ctx_obj)
+    if msg is not None:
+        await embedding_queue.enqueue(msg)
+
+
 async def ingest_one(
     novel: str,
     md_path: Path,
     dry_run: bool,
-    viking_fs: Optional[object] = None,
-    embedding_queue: Optional[object] = None,
+    viking_fs: Optional[Any] = None,
+    embedding_queue: Optional[Any] = None,
     account_id: Optional[str] = None,
     user_id: Optional[str] = None,
 ) -> int:
@@ -45,8 +85,16 @@ async def ingest_one(
                 preview = part.replace("\n", " ")[:80]
                 print(f"[DRY] {uri}  ({len(part)} chars)  {preview}...")
             else:
-                # Real ingest path is implemented in Task 2.2.
-                raise NotImplementedError("real ingest pending Task 2.2")
+                assert viking_fs is not None and embedding_queue is not None
+                assert account_id is not None and user_id is not None
+                await _real_ingest_chunk(
+                    viking_fs,
+                    embedding_queue,
+                    uri=uri,
+                    content=part,
+                    account_id=account_id,
+                    user_id=user_id,
+                )
             total += 1
     return total
 
@@ -61,12 +109,40 @@ async def main():
         help="Novels to ingest (default: all three).",
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview only; do not write.")
+    parser.add_argument(
+        "--account-id",
+        help="Account ID for the Context (required for real ingest).",
+    )
+    parser.add_argument(
+        "--user-id",
+        help="User ID for the Context (required for real ingest).",
+    )
     args = parser.parse_args()
+
+    viking_fs: Optional[Any] = None
+    embedding_queue: Optional[Any] = None
+
+    if not args.dry_run:
+        if not args.account_id or not args.user_id:
+            parser.error("--account-id and --user-id are required when not --dry-run")
+        from openviking.storage.queuefs.queue_manager import get_queue_manager
+        from openviking.storage.viking_fs import get_viking_fs
+
+        viking_fs = get_viking_fs()
+        embedding_queue = get_queue_manager().get_queue("EMBEDDING")
 
     grand_total = 0
     for novel in args.novels:
         md_path = Path(NOVEL_MAP[novel])
-        n = await ingest_one(novel, md_path, args.dry_run)
+        n = await ingest_one(
+            novel,
+            md_path,
+            args.dry_run,
+            viking_fs=viking_fs,
+            embedding_queue=embedding_queue,
+            account_id=args.account_id,
+            user_id=args.user_id,
+        )
         print(f"[{novel}] {n} chunks")
         grand_total += n
     print(f"TOTAL: {grand_total} chunks")
