@@ -63,6 +63,7 @@ report.html
 # Virtual environments
 .env
 .venv
+.venv-flattern/
 env/
 venv/
 ENV/
