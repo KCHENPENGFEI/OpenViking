@@ -8,26 +8,28 @@ relies on for hierarchy.
 
 import re
 
-_BAD_PATH_CHARS = re.compile(r"[/\\]")
+# Path separators + any whitespace (incl. CJK full-width space 　, tab, etc.)
+# get collapsed into a single underscore.
+_SANITIZE_PATTERN = re.compile(r"[\s/\\]+")
 
 
 def _sanitize(text: str) -> str:
-    """Replace path separators in user-supplied strings so they cannot break the URI."""
-    return _BAD_PATH_CHARS.sub("_", text).strip()
+    """Normalize a URI field: trim both ends, then collapse whitespace/path
+    separators into a single underscore. Idempotent.
+    """
+    return _SANITIZE_PATTERN.sub("_", text.strip())
 
 
 def build_flat_uri(novel: str, volume: str, chapter: str, chunk_idx: int) -> str:
     """Build a flat ``viking://resource/{novel}[_{volume}]_{chapter}_{idx}.md`` URI.
 
-    Args:
-        novel: novel name, e.g. ``"神雕侠侣"``.
-        volume: volume label or name. Empty string when the novel has no volume tier.
-        chapter: chapter title (heading text, e.g. ``"第一回 风月无情"``).
-        chunk_idx: 1-based chunk index within the chapter.
+    Each field passes through ``_sanitize`` first.
     """
     parts = [_sanitize(novel)]
     if volume:
-        parts.append(_sanitize(volume))
+        sanitized_volume = _sanitize(volume)
+        if sanitized_volume:
+            parts.append(sanitized_volume)
     parts.append(_sanitize(chapter))
     name = "_".join(parts) + f"_{chunk_idx}.md"
     return f"viking://resource/{name}"
