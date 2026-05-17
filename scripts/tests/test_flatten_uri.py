@@ -35,23 +35,18 @@ def test_uri_normalizes_slashes_in_titles():
 
 def test_uri_trims_field_whitespace():
     """Leading/trailing whitespace on each field is trimmed before joining."""
-    assert (
-        build_flat_uri("  X  ", " V ", "  第一章  ", 1)
-        == "viking://resource/X_V_第一章_1.md"
-    )
+    assert build_flat_uri("  X  ", " V ", "  第一章  ", 1) == "viking://resource/X_V_第一章_1.md"
 
 
 def test_uri_collapses_consecutive_whitespace():
     """Multiple consecutive spaces collapse into a single underscore."""
-    assert (
-        build_flat_uri("X", "", "a    b", 1)
-        == "viking://resource/X_a_b_1.md"
-    )
+    assert build_flat_uri("X", "", "a    b", 1) == "viking://resource/X_a_b_1.md"
 
 
 def test_uri_sanitize_is_idempotent():
     """Sanitizing an already-sanitized field is a no-op."""
     from scripts._flatten_uri import _sanitize
+
     once = _sanitize("a  b  c")
     twice = _sanitize(once)
     assert once == twice == "a_b_c"

@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import List
 
 from openviking.parse.parsers.markdown import MarkdownParser
-
 from scripts._flatten_uri import _sanitize
 
 
