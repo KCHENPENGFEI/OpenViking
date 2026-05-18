@@ -1,7 +1,7 @@
 """Flat ingest script for the ov_flattern experiment.
 
 Walks the three target novels' markdown files, detects chapters, chunks them,
-and writes them flat under viking://resource/. Each chunk goes through
+and writes them flat under viking://resources/. Each chunk goes through
 ``VikingFS.write_file`` and is then enqueued to the EMBEDDING queue with a
 ``Context`` whose ``level=DETAIL`` and ``abstract=""``.
 

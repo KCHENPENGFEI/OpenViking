@@ -1,6 +1,6 @@
 """Flat AGFS URI builder for the ov_flattern experiment.
 
-URIs are produced under viking://resource/, with the hierarchy
+URIs are produced under viking://resources/, with the hierarchy
 (novel / volume? / chapter / chunk_idx) encoded directly into the file name
 because the experiment removes the directory tree that current OpenViking
 relies on for hierarchy.
@@ -21,7 +21,7 @@ def _sanitize(text: str) -> str:
 
 
 def build_flat_uri(novel: str, volume: str, chapter: str, chunk_idx: int) -> str:
-    """Build a flat ``viking://resource/{novel}[_{volume}]_{chapter}_{idx}.md`` URI.
+    """Build a flat ``viking://resources/{novel}[_{volume}]_{chapter}_{idx}.md`` URI.
 
     Each field passes through ``_sanitize`` first.
     """
@@ -32,4 +32,4 @@ def build_flat_uri(novel: str, volume: str, chapter: str, chunk_idx: int) -> str
             parts.append(sanitized_volume)
     parts.append(_sanitize(chapter))
     name = "_".join(parts) + f"_{chunk_idx}.md"
-    return f"viking://resource/{name}"
+    return f"viking://resources/{name}"

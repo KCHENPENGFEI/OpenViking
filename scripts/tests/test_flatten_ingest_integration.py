@@ -18,7 +18,7 @@ async def test_real_ingest_chunk_writes_file_and_enqueues():
     await _real_ingest_chunk(
         viking_fs,
         embedding_queue,
-        uri="viking://resource/神雕侠侣_第一回 风月无情_1.md",
+        uri="viking://resources/神雕侠侣_第一回 风月无情_1.md",
         content="### 第一回 风月无情\n\n正文…",
         account_id="acc_test",
         user_id="user_test",
@@ -27,7 +27,7 @@ async def test_real_ingest_chunk_writes_file_and_enqueues():
     # 1) AGFS write was called once with the expected URI and chunk content
     viking_fs.write_file.assert_awaited_once()
     write_args, _ = viking_fs.write_file.await_args
-    assert write_args[0] == "viking://resource/神雕侠侣_第一回 风月无情_1.md"
+    assert write_args[0] == "viking://resources/神雕侠侣_第一回 风月无情_1.md"
     assert "第一回 风月无情" in write_args[1]
 
     # 2) EmbeddingQueue.enqueue was called once with a message whose context_data
