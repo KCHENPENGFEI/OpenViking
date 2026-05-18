@@ -25,10 +25,13 @@ Runtime model:
     APIs.
 
 Config selection:
-    The script uses the OpenViking config pointed to by ``--config`` (required
-    for non-dry-run) by setting ``OPENVIKING_CONFIG_FILE`` before any
-    openviking import. This prevents accidentally writing to the baseline
-    workspace when the env var is missing in the shell.
+    The script sniffs ``--config`` from ``sys.argv`` BEFORE importing any
+    openviking module, then sets ``OPENVIKING_CONFIG_FILE``. This is
+    critical because transitively-imported modules (e.g. via
+    scripts._flatten_chunker -> openviking.parse.parsers.markdown) would
+    otherwise eagerly initialize the OpenViking config singleton with the
+    default ``~/.openviking/ov.conf``, locking it before main() can set the
+    env var. The pattern mirrors openviking_cli/server_bootstrap.py.
 
 Metrics:
     Per-novel ingest duration (wall-clock from enqueue start to drain end)
@@ -48,16 +51,60 @@ Usage:
         --novels 神雕侠侣 仙逆 诛仙
 """
 
-import argparse
-import asyncio
+# ====================================================================
+# CRITICAL ORDERING: set OPENVIKING_CONFIG_FILE before any openviking
+# import (direct or transitive). Stdlib-only sniff of sys.argv.
+# ====================================================================
 import os
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Optional
+import sys
 
-from scripts._flatten_chunker import chunk_chapter, locate_chapters
-from scripts._flatten_uri import build_flat_uri
+
+def _early_sniff_config_arg(argv: list[str]) -> "str | None":
+    """Find --config in argv and return its value, supporting both
+    ``--config PATH`` and ``--config=PATH`` forms. Stdlib only — no argparse,
+    no openviking imports.
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--config":
+            if i + 1 < len(argv):
+                return argv[i + 1]
+            return None
+        if arg.startswith("--config="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _apply_early_config_env() -> None:
+    """If --config is present on the command line, validate + set the env var
+    immediately so that subsequent openviking imports load the right config.
+    """
+    raw = _early_sniff_config_arg(sys.argv[1:])
+    if not raw:
+        return
+    resolved = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isfile(resolved):
+        # Mirror the argparse error tone; exit before any openviking import.
+        sys.stderr.write(f"flatten_ingest.py: error: --config path does not exist: {resolved}\n")
+        sys.exit(2)
+    os.environ["OPENVIKING_CONFIG_FILE"] = resolved
+    print(f"[flatten_ingest] OPENVIKING_CONFIG_FILE = {resolved}")
+
+
+_apply_early_config_env()
+
+# ====================================================================
+# Safe to import everything else now. Any module below may transitively
+# trigger OpenVikingConfig singleton load; the env var is already set.
+# ====================================================================
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any, Dict, Optional  # noqa: E402
+
+from scripts._flatten_chunker import chunk_chapter, locate_chapters  # noqa: E402
+from scripts._flatten_uri import build_flat_uri  # noqa: E402
 
 NOVEL_MAP = {
     "神雕侠侣": "/Users/bytedance/Documents/byterec/viking_evals/神雕侠侣.md",
@@ -141,11 +188,6 @@ async def ingest_one(
     return total
 
 
-def _resolve_config_path(raw: str) -> str:
-    """Expand ``~`` and return an absolute path."""
-    return os.path.abspath(os.path.expanduser(raw))
-
-
 def _print_summary(stats: Dict[str, NovelStats]) -> None:
     """Print a fixed-width per-novel summary table."""
     if not stats:
@@ -180,7 +222,9 @@ async def main():
         help=(
             "Path to OpenViking config file (e.g. ~/.openviking/ov-flattern.conf). "
             "REQUIRED for non-dry-run to prevent accidental writes to the baseline "
-            "workspace. Optional for --dry-run."
+            "workspace. Optional for --dry-run. NOTE: the script sniffs this argument "
+            "BEFORE argparse runs (via sys.argv) so the OPENVIKING_CONFIG_FILE env var "
+            "is set before any openviking import — argparse here is for validation only."
         ),
     )
     parser.add_argument(
@@ -212,18 +256,16 @@ async def main():
         if not args.account_id or not args.user_id:
             parser.error("--account-id and --user-id are required when not --dry-run")
 
-    if args.config:
-        resolved = _resolve_config_path(args.config)
-        if not os.path.isfile(resolved):
-            parser.error(f"--config path does not exist: {resolved}")
-        os.environ["OPENVIKING_CONFIG_FILE"] = resolved
-        print(f"[flatten_ingest] OPENVIKING_CONFIG_FILE = {resolved}")
-    else:
-        env_config = os.environ.get(
-            "OPENVIKING_CONFIG_FILE",
-            "(unset, would default to ~/.openviking/ov.conf)",
-        )
-        print(f"[flatten_ingest] (dry-run) OPENVIKING_CONFIG_FILE = {env_config}")
+    # By this point the env var has either been set by _apply_early_config_env (if --config
+    # was passed) or remains whatever the shell had (dry-run with no --config). Print the
+    # final effective value so the user can see exactly which config will be used.
+    effective_config = os.environ.get(
+        "OPENVIKING_CONFIG_FILE",
+        "(unset, would default to ~/.openviking/ov.conf)",
+    )
+    if args.dry_run and not args.config:
+        print(f"[flatten_ingest] (dry-run) OPENVIKING_CONFIG_FILE = {effective_config}")
+    # If args.config was set, _apply_early_config_env already printed the path.
 
     viking_fs: Optional[Any] = None
     embedding_queue: Optional[Any] = None
@@ -232,8 +274,8 @@ async def main():
     token_tracker: Optional[Any] = None
 
     if not args.dry_run:
-        # Imports deferred until after env var is set so the config singleton
-        # picks up the correct config file.
+        # Imports deferred until inside main() to avoid pulling the live runtime
+        # on dry-run; the config env var is already set above.
         from openviking.models.embedder.base import _get_token_tracker
         from openviking.service.core import OpenVikingService
         from openviking.storage.queuefs.queue_manager import get_queue_manager
@@ -264,7 +306,6 @@ async def main():
                 print(f"[{novel}] {n} chunks")
                 continue
 
-            # Real-ingest path: serialize per novel so token deltas attribute correctly.
             assert token_tracker is not None and queue_manager is not None
             start_t = time.perf_counter()
             baseline_tokens = token_tracker.get_total_usage().prompt_tokens
