@@ -48,8 +48,12 @@ class PendingResponse:
         self.final_content: Optional[str] = None
         self.response_id: Optional[str] = None
         self.relevant_memories: Optional[str] = None
-        self.token_usage: Dict[str, int] = {}
+        self.token_usage: Optional[Dict[str, int]] = None
+        self.iteration: Optional[int] = None
+        self.tools_used_names: Optional[List[str]] = None
+        self.time_cost: Optional[float] = None
         self.event = asyncio.Event()
+        self.completed_event = asyncio.Event()
         self.stream_queue: asyncio.Queue[Optional[ChatStreamEvent]] = asyncio.Queue()
 
     async def add_event(self, event_type: str, data: Any):
@@ -66,6 +70,17 @@ class PendingResponse:
     def set_response_id(self, response_id: str | None):
         """Track the response ID for the final assistant response."""
         self.response_id = response_id
+
+    def set_completion_metadata(self, rc: Dict[str, Any]) -> None:
+        """Record token_usage / iteration / tools / time_cost from RESPONSE_COMPLETED."""
+        self.token_usage = rc.get("token_usage")
+        self.iteration = rc.get("iteration")
+        tools = rc.get("tools_used_names")
+        # Defensive: ensure it's a list of strings if present
+        if isinstance(tools, list):
+            self.tools_used_names = [str(t) for t in tools]
+        self.time_cost = rc.get("time_cost")
+        self.completed_event.set()
 
     async def close_stream(self):
         """Close the stream queue."""
@@ -219,6 +234,9 @@ class OpenAPIChannel(BaseChannel):
                 await pending.add_event("tool_call", msg.content)
             elif msg.event_type == OutboundEventType.TOOL_RESULT:
                 await pending.add_event("tool_result", msg.content)
+            elif msg.event_type == OutboundEventType.RESPONSE_COMPLETED:
+                rc = (msg.metadata or {}).get("response_completed") or {}
+                pending.set_completion_metadata(rc)
             return
 
         # Handle as normal OpenAPIChannel message
@@ -246,6 +264,9 @@ class OpenAPIChannel(BaseChannel):
             await pending.add_event("tool_call", msg.content)
         elif msg.event_type == OutboundEventType.TOOL_RESULT:
             await pending.add_event("tool_result", msg.content)
+        elif msg.event_type == OutboundEventType.RESPONSE_COMPLETED:
+            rc = (msg.metadata or {}).get("response_completed") or {}
+            pending.set_completion_metadata(rc)
 
     def get_router(self) -> APIRouter:
         """Get or create the FastAPI router."""
@@ -496,6 +517,13 @@ class OpenAPIChannel(BaseChannel):
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=504, detail="Request timeout")
 
+            # Give RESPONSE_COMPLETED a short window to arrive so completion
+            # metadata (token_usage / iteration / tools_used_names / time_cost) lands.
+            try:
+                await asyncio.wait_for(pending.completed_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+
             # Build response
             response_content = pending.final_content or ""
 
@@ -506,6 +534,9 @@ class OpenAPIChannel(BaseChannel):
                 events=pending.events if pending.events else None,
                 relevant_memories=pending.relevant_memories,
                 token_usage=pending.token_usage,
+                iteration=pending.iteration,
+                tools_used_names=pending.tools_used_names,
+                time_cost=pending.time_cost,
             )
 
         except HTTPException:
@@ -642,6 +673,13 @@ class OpenAPIChannel(BaseChannel):
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=504, detail="Request timeout")
 
+            # Give RESPONSE_COMPLETED a short window to arrive so completion
+            # metadata (token_usage / iteration / tools_used_names / time_cost) lands.
+            try:
+                await asyncio.wait_for(pending.completed_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+
             # Build response
             response_content = pending.final_content or ""
 
@@ -652,6 +690,9 @@ class OpenAPIChannel(BaseChannel):
                 events=pending.events if pending.events else None,
                 relevant_memories=pending.relevant_memories,
                 token_usage=pending.token_usage,
+                iteration=pending.iteration,
+                tools_used_names=pending.tools_used_names,
+                time_cost=pending.time_cost,
             )
 
         except HTTPException:

@@ -79,9 +79,22 @@ class ChatResponse(BaseModel):
         default=None,
         description="OpenViking memories assembled during _process_message",
     )
-    token_usage: Dict[str, int] = Field(
-        default_factory=dict,
-        description="Token usage statistics (prompt_tokens, completion_tokens, total_tokens)",
+    token_usage: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Token usage aggregated over the agent loop: "
+        "{prompt_tokens, completion_tokens, total_tokens}",
+    )
+    iteration: Optional[int] = Field(
+        default=None,
+        description="Number of agent-loop iterations consumed for this response.",
+    )
+    tools_used_names: Optional[List[str]] = Field(
+        default=None,
+        description="Names of tools the agent actually invoked.",
+    )
+    time_cost: Optional[float] = Field(
+        default=None,
+        description="Agent-loop wall-clock cost in seconds (server-side).",
     )
     timestamp: datetime = Field(default_factory=datetime.now, description="Response timestamp")
 
