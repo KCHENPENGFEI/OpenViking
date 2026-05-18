@@ -246,7 +246,7 @@ async def main():
 
         viking_fs = get_viking_fs()
         queue_manager = get_queue_manager()
-        embedding_queue = queue_manager.get_queue("EMBEDDING")
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
         token_tracker = _get_token_tracker()
 
     stats: Dict[str, NovelStats] = {}
@@ -281,7 +281,7 @@ async def main():
 
             print(f"[{novel}] {n} chunks enqueued; waiting for EMBEDDING queue to drain...")
             await queue_manager.wait_complete(
-                queue_name="EMBEDDING",
+                queue_name=queue_manager.EMBEDDING,
                 timeout=args.drain_timeout,
             )
 
