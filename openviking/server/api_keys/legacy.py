@@ -158,6 +158,18 @@ class LegacyAPIKeyManager:
             sum(len(info.users) for info in self._accounts.values()),
         )
 
+        # --- DEBUG: 打印所有 account/user 的 API Key ---
+        for account_id, info in self._accounts.items():
+            for user_id, user_info in info.users.items():
+                key = user_info.get("key", "")
+                role = user_info.get("role", "user")
+                if key.startswith("$argon2"):
+                    prefix = user_info.get("key_prefix", key[:8])
+                    print(f"  [{account_id}] {user_id} ({role}): <hashed, prefix={prefix}>")
+                else:
+                    print(f"  [{account_id}] {user_id} ({role}): {key}")
+        # --- END DEBUG ---
+
     def _resolve_namespace_policy(
         self,
         settings_data: Optional[dict],

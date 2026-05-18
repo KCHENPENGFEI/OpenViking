@@ -29,7 +29,7 @@ class OvClient:
         user_api_key: str,
         account_id: Optional[str] = None,
         user_id: Optional[str] = None,
-        timeout: float = 300.0,
+        timeout: float = 86400.0,
         transport: Optional[httpx.BaseTransport] = None,
     ):
         self._client = httpx.Client(

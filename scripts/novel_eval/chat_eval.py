@@ -144,6 +144,7 @@ def _format_cell_with_metrics(
     token_usage: Optional[dict],
     iteration: Optional[int],
     tools_used_names: Optional[list[str]],
+    time_cost: Optional[float] = None,
 ) -> str:
     if token_usage:
         p = token_usage.get("prompt_tokens", 0)
@@ -157,7 +158,11 @@ def _format_cell_with_metrics(
         tools_part = f"tools=[{','.join(tools_used_names) if tools_used_names else ''}]"
     else:
         tools_part = "tools=N/A"
-    return f"{bot_msg}\n\n[metrics] dur={duration_s:.2f}s {tok_part} {iter_part} {tools_part}"
+    srv_part = f"srv_time={time_cost:.2f}s" if time_cost is not None else "srv_time=N/A"
+    return (
+        f"{bot_msg}\n\n[metrics] dur={duration_s:.2f}s {srv_part} "
+        f"{tok_part} {iter_part} {tools_part}"
+    )
 
 
 def _format_avg(metrics: list[dict[str, Any]]) -> str:
@@ -203,7 +208,16 @@ def _format_avg(metrics: list[dict[str, Any]]) -> str:
     else:
         tools_part = "tools=N/A"
 
-    return f"[metrics-avg] dur_avg={dur_avg:.2f}s {tok_part} {iter_part} {tools_part} n={n}"
+    have_srv_time = [m for m in metrics if m.get("time_cost") is not None]
+    if have_srv_time:
+        srv_avg = sum(m["time_cost"] for m in have_srv_time) / len(have_srv_time)
+        srv_part = f"srv_time_avg={srv_avg:.2f}s (n_srv={len(have_srv_time)})"
+    else:
+        srv_part = "srv_time_avg=N/A"
+
+    return (
+        f"[metrics-avg] dur_avg={dur_avg:.2f}s {srv_part} {tok_part} {iter_part} {tools_part} n={n}"
+    )
 
 
 async def _process_row(
@@ -328,6 +342,7 @@ async def _process_row_inner(
         token_usage: Optional[dict] = None
         iteration: Optional[int] = None
         tools_used_names: Optional[list[str]] = None
+        time_cost: Optional[float] = None
         failed = False
         try:
             resp = await client.post_json("/bot/v1/chat", json=body)
@@ -335,6 +350,7 @@ async def _process_row_inner(
             token_usage = resp.get("token_usage")
             iteration = resp.get("iteration")
             tools_used_names = resp.get("tools_used_names")
+            time_cost = resp.get("time_cost")
             if not bot_msg:
                 bot_msg = f"[ERROR] empty response: {json.dumps(resp, ensure_ascii=False)[:200]}"
                 failed = True
@@ -344,9 +360,10 @@ async def _process_row_inner(
 
         duration_s = time.monotonic() - t0
         logger.info(
-            "row=%d done in %.2fs (resp_len=%d, tokens=%s, iter=%s, tools=%s)",
+            "row=%d done in %.2fs (srv=%s, resp_len=%d, tokens=%s, iter=%s, tools=%s)",
             row_num,
             duration_s,
+            time_cost,
             len(bot_msg),
             token_usage,
             iteration,
@@ -354,11 +371,13 @@ async def _process_row_inner(
         )
 
         cell_value = _format_cell_with_metrics(
-            bot_msg, duration_s, token_usage, iteration, tools_used_names
+            bot_msg, duration_s, token_usage, iteration, tools_used_names, time_cost
         )
 
         async with persist_lock:
             ws.cell(row=row_num, column=response_col, value=cell_value)
+            # Judge JSON: only the raw bot_response, no metrics — keeps the
+            # downstream LLM-as-judge prompt focused on answer quality.
             judge_records.append(
                 {"novel": novel, "query_id": f"row_{row_num}", "bot_response": bot_msg}
             )
@@ -366,6 +385,7 @@ async def _process_row_inner(
                 metrics.append(
                     {
                         "duration_s": duration_s,
+                        "time_cost": time_cost,
                         "token_usage": token_usage,
                         "iteration": iteration,
                         "tools_used_names": tools_used_names,
