@@ -263,8 +263,24 @@ def test_chat_eval_edits_existing_out_xlsx_in_place(sample_xlsx: Path, tmp_path:
     assert "[metrics-avg]" in str(ws.cell(row=avg_r, column=9).value)  # model-B's avg
 
 
-def test_concurrent_runs_use_shared_session(sample_xlsx: Path, tmp_path: Path, monkeypatch):
-    """All concurrent rows must carry the same session_id."""
+def _make_multi_row_xlsx(tmp_path: Path, n: int = 5) -> Path:
+    """Build a small xlsx with `n` independent data rows for session tests."""
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["novel", "extra", "system_prompt", "user_prompt", "x", "y", "z", "response"])
+    for i in range(n):
+        ws.append([f"novel-{i}", None, "讲这部小说。", f"q{i}", None, None, None, None])
+    path = tmp_path / "multi.xlsx"
+    wb.save(path)
+    return path
+
+
+def test_concurrent_runs_use_shared_session_opt_in(sample_xlsx: Path, tmp_path: Path, monkeypatch):
+    """With --no-session-per-row, all rows must carry the same session_id.
+
+    This used to be the default; --no-session-per-row keeps it available for
+    multi-turn coherence experiments.
+    """
     seen_sessions: list[str] = []
 
     def transport(request: httpx.Request) -> httpx.Response:
@@ -272,15 +288,45 @@ def test_concurrent_runs_use_shared_session(sample_xlsx: Path, tmp_path: Path, m
         seen_sessions.append(body["session_id"])
         return httpx.Response(200, json={"session_id": body["session_id"], "message": "ok"})
 
-    # 5 data rows to give concurrency something to do
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["novel", "extra", "system_prompt", "user_prompt", "x", "y", "z", "response"])
-    for i in range(5):
-        ws.append([f"novel-{i}", None, "讲这部小说。", f"q{i}", None, None, None, None])
-    big_xlsx = tmp_path / "big.xlsx"
-    wb.save(big_xlsx)
+    big_xlsx = _make_multi_row_xlsx(tmp_path, n=5)
+    out_xlsx = tmp_path / "out.xlsx"
+    out_judge = tmp_path / "out.judge.json"
 
+    import scripts.novel_eval.chat_eval as ce
+
+    argv = _argv(
+        **{
+            "--xlsx": str(big_xlsx),
+            "--concurrency": "3",
+            "--session-id": "shared-S",
+            "--out-xlsx": str(out_xlsx),
+            "--out-judge": str(out_judge),
+        }
+    )
+    argv.append("--no-session-per-row")
+    monkeypatch.setattr("sys.argv", argv)
+    _patch_async_client(monkeypatch, transport)
+    rc = ce.main()
+    assert rc == 0
+    assert len(seen_sessions) == 5
+    assert all(s == "shared-S" for s in seen_sessions)
+
+
+def test_session_per_row_is_default(sample_xlsx: Path, tmp_path: Path, monkeypatch):
+    """Default behavior: each row gets a unique session id `{base}-row{N:03d}`.
+
+    This prevents in-context drift where the model, after seeing a few prior
+    direct-answer turns in shared session history, stops calling required tools
+    on later turns.
+    """
+    seen_sessions: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen_sessions.append(body["session_id"])
+        return httpx.Response(200, json={"session_id": body["session_id"], "message": "ok"})
+
+    big_xlsx = _make_multi_row_xlsx(tmp_path, n=5)
     out_xlsx = tmp_path / "out.xlsx"
     out_judge = tmp_path / "out.judge.json"
 
@@ -292,7 +338,7 @@ def test_concurrent_runs_use_shared_session(sample_xlsx: Path, tmp_path: Path, m
             **{
                 "--xlsx": str(big_xlsx),
                 "--concurrency": "3",
-                "--session-id": "shared-S",
+                "--session-id": "base-S",
                 "--out-xlsx": str(out_xlsx),
                 "--out-judge": str(out_judge),
             }
@@ -302,7 +348,15 @@ def test_concurrent_runs_use_shared_session(sample_xlsx: Path, tmp_path: Path, m
     rc = ce.main()
     assert rc == 0
     assert len(seen_sessions) == 5
-    assert all(s == "shared-S" for s in seen_sessions)
+    # Rows are 2..6 in the xlsx (row 1 is header). Each gets its own id.
+    assert sorted(seen_sessions) == [
+        "base-S-row002",
+        "base-S-row003",
+        "base-S-row004",
+        "base-S-row005",
+        "base-S-row006",
+    ]
+    assert len(set(seen_sessions)) == 5  # all unique
 
 
 def test_account_id_propagates_as_query_param(sample_xlsx: Path, tmp_path: Path, monkeypatch):

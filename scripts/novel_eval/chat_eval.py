@@ -80,7 +80,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--session-id",
         default="auto",
-        help="Session id; 'auto' = chat-eval-<utc-iso>. Shared across all rows in a run.",
+        help="Base session id; 'auto' = chat-eval-<utc-iso>. By default each row "
+        "gets its own session id derived from this base (see --no-session-per-row "
+        "to opt out).",
+    )
+    p.add_argument(
+        "--session-per-row",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use a unique session id per row ({base}-row{N:03d}) so each query "
+        "is evaluated independently without picking up in-context drift from "
+        "previous rows' responses. Default on. Use --no-session-per-row to share "
+        "one session across all rows (only useful for multi-turn coherence tests).",
     )
     p.add_argument("--channel-id", default=None)
     p.add_argument("--out-xlsx", default=None, type=Path)
@@ -408,7 +419,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 2
 
     now = datetime.now(timezone.utc)
-    session_id = default_session_id(now=now) if args.session_id == "auto" else args.session_id
+    base_session_id = default_session_id(now=now) if args.session_id == "auto" else args.session_id
     out_xlsx_default, out_judge_default = default_out_paths(xlsx=xlsx, now=now)
     out_xlsx: Path = args.out_xlsx or out_xlsx_default
     out_judge: Path = args.out_judge or out_judge_default
@@ -464,12 +475,32 @@ async def _run(args: argparse.Namespace) -> int:
 
     sem = asyncio.Semaphore(args.concurrency)
     persist_lock = asyncio.Lock()
-    logger.info(
-        "starting %d rows with concurrency=%d session=%s",
-        len(rows_to_process),
-        args.concurrency,
-        session_id,
-    )
+    if args.session_per_row:
+        logger.info(
+            "starting %d rows with concurrency=%d session_base=%s session_per_row=True",
+            len(rows_to_process),
+            args.concurrency,
+            base_session_id,
+        )
+    else:
+        logger.info(
+            "starting %d rows with concurrency=%d session=%s session_per_row=False",
+            len(rows_to_process),
+            args.concurrency,
+            base_session_id,
+        )
+
+    def _row_session_id(row_num: int) -> str:
+        """Return the session_id to use for this row.
+
+        With --session-per-row (default), each row gets `{base}-row{N:03d}` so
+        the bot starts every query from a clean session — no in-context drift
+        from prior rows' assistant responses (which is what makes the model
+        skip openviking_search after a few turns).
+        """
+        if args.session_per_row:
+            return f"{base_session_id}-row{row_num:03d}"
+        return base_session_id
 
     async with AsyncOvClient(
         base_url=args.base_url,
@@ -484,7 +515,7 @@ async def _run(args: argparse.Namespace) -> int:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 inject=inject,
-                session_id=session_id,
+                session_id=_row_session_id(row_num),
                 user_id=args.user_id,
                 channel_id=args.channel_id,
                 client=client,
@@ -525,13 +556,15 @@ async def _run(args: argparse.Namespace) -> int:
     _persist(wb, out_xlsx, judge_records, out_judge)
 
     logger.info(
-        "done: out_xlsx=%s out_judge=%s failures=%d total=%d avg_row=%d session=%s",
+        "done: out_xlsx=%s out_judge=%s failures=%d total=%d avg_row=%d session_base=%s "
+        "session_per_row=%s",
         out_xlsx,
         out_judge,
         failures,
         len(judge_records),
         avg_row,
-        session_id,
+        base_session_id,
+        args.session_per_row,
     )
     return 0 if failures == 0 else 1
 
