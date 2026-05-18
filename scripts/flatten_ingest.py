@@ -2,8 +2,9 @@
 
 Walks the three target novels' markdown files, detects chapters, chunks them,
 and writes them flat under viking://resources/. Each chunk goes through
-``VikingFS.write_file`` and is then enqueued to the EMBEDDING queue with a
-``Context`` whose ``level=DETAIL`` and ``abstract=""``.
+``VikingFS.write_file`` (under a RequestContext built from the CLI's
+``--account-id`` / ``--user-id`` / ``--agent-id``) and is then enqueued to the
+EMBEDDING queue with a ``Context`` whose ``level=DETAIL`` and ``abstract=""``.
 
 VLM-driven abstract/overview generation is bypassed entirely: the SemanticQueue
 is never enqueued. At retrieval time there are no L0/L1 records, so the
@@ -33,6 +34,14 @@ Config selection:
     default ``~/.openviking/ov.conf``, locking it before main() can set the
     env var. The pattern mirrors openviking_cli/server_bootstrap.py.
 
+Identity:
+    The script builds a ``RequestContext`` with ``Role.ROOT`` from
+    ``--account-id``, ``--user-id``, ``--agent-id``. This ctx is passed to
+    ``VikingFS.write_file(ctx=...)`` so files land at
+    ``/local/{account_id}/resources/...`` instead of the default account
+    namespace, and to ``Context(user=...)`` so VikingDB record owner fields
+    match.
+
 Metrics:
     Per-novel ingest duration (wall-clock from enqueue start to drain end)
     and embedding prompt token consumption (delta of the embedder's process-
@@ -44,17 +53,17 @@ Usage:
     # Preview only (config optional, no service bootstrap):
     python scripts/flatten_ingest.py --dry-run
 
-    # Real ingest (server MUST be stopped):
-    python scripts/flatten_ingest.py \\
-        --config ~/.openviking/ov-flattern.conf \\
-        --account-id ACC --user-id USR \\
-        --novels 神雕侠侣 仙逆 诛仙
-
     # Smoke test (write only 5 chunks per novel, ~15 total):
     python scripts/flatten_ingest.py \\
         --config ~/.openviking/ov-flattern.conf \\
         --account-id ACC --user-id USR \\
         --max-chunks-per-novel 5
+
+    # Real ingest (server MUST be stopped):
+    python scripts/flatten_ingest.py \\
+        --config ~/.openviking/ov-flattern.conf \\
+        --account-id ACC --user-id USR \\
+        --novels 神雕侠侣 仙逆 诛仙
 """
 
 # ====================================================================
@@ -65,10 +74,9 @@ import os
 import sys
 
 
-def _early_sniff_config_arg(argv: list[str]) -> "str | None":
+def _early_sniff_config_arg(argv: "list[str]") -> "str | None":
     """Find --config in argv and return its value, supporting both
-    ``--config PATH`` and ``--config=PATH`` forms. Stdlib only — no argparse,
-    no openviking imports.
+    ``--config PATH`` and ``--config=PATH`` forms. Stdlib only.
     """
     for i, arg in enumerate(argv):
         if arg == "--config":
@@ -81,15 +89,11 @@ def _early_sniff_config_arg(argv: list[str]) -> "str | None":
 
 
 def _apply_early_config_env() -> None:
-    """If --config is present on the command line, validate + set the env var
-    immediately so that subsequent openviking imports load the right config.
-    """
     raw = _early_sniff_config_arg(sys.argv[1:])
     if not raw:
         return
     resolved = os.path.abspath(os.path.expanduser(raw))
     if not os.path.isfile(resolved):
-        # Mirror the argparse error tone; exit before any openviking import.
         sys.stderr.write(f"flatten_ingest.py: error: --config path does not exist: {resolved}\n")
         sys.exit(2)
     os.environ["OPENVIKING_CONFIG_FILE"] = resolved
@@ -99,8 +103,7 @@ def _apply_early_config_env() -> None:
 _apply_early_config_env()
 
 # ====================================================================
-# Safe to import everything else now. Any module below may transitively
-# trigger OpenVikingConfig singleton load; the env var is already set.
+# Safe to import everything else now.
 # ====================================================================
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
@@ -134,24 +137,23 @@ async def _real_ingest_chunk(
     *,
     uri: str,
     content: str,
-    account_id: str,
-    user_id: str,
+    ctx: Any,
 ) -> None:
-    """Write one chunk to AGFS and enqueue its embedding.
+    """Write one chunk to AGFS (under ctx.account) and enqueue its embedding.
 
     Imports are deferred to keep unit-test setup lightweight.
     """
     from openviking.core.context import Context, ContextLevel, Vectorize
     from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 
-    await viking_fs.write_file(uri, content)
+    await viking_fs.write_file(uri, content, ctx=ctx)
 
     ctx_obj = Context(
         uri=uri,
         level=ContextLevel.DETAIL,
         is_leaf=True,
         abstract="",
-        account_id=account_id,
+        user=ctx.user,
     )
     ctx_obj.set_vectorize(Vectorize(text=content))
     msg = EmbeddingMsgConverter.from_context(ctx_obj)
@@ -165,8 +167,7 @@ async def ingest_one(
     dry_run: bool,
     viking_fs: Optional[Any] = None,
     embedding_queue: Optional[Any] = None,
-    account_id: Optional[str] = None,
-    user_id: Optional[str] = None,
+    ctx: Optional[Any] = None,
     max_chunks: Optional[int] = None,
 ) -> int:
     """Ingest one novel. Returns the number of chunks produced."""
@@ -183,22 +184,19 @@ async def ingest_one(
                 preview = part.replace("\n", " ")[:80]
                 print(f"[DRY] {uri}  ({len(part)} chars)  {preview}...")
             else:
-                assert viking_fs is not None and embedding_queue is not None
-                assert account_id is not None and user_id is not None
+                assert viking_fs is not None and embedding_queue is not None and ctx is not None
                 await _real_ingest_chunk(
                     viking_fs,
                     embedding_queue,
                     uri=uri,
                     content=part,
-                    account_id=account_id,
-                    user_id=user_id,
+                    ctx=ctx,
                 )
             total += 1
     return total
 
 
 def _print_summary(stats: Dict[str, NovelStats]) -> None:
-    """Print a fixed-width per-novel summary table."""
     if not stats:
         return
     print()
@@ -238,17 +236,21 @@ async def main():
     )
     parser.add_argument(
         "--account-id",
-        help="Account ID for the Context (required for real ingest).",
+        help="Account ID for the experiment (required for real ingest).",
     )
     parser.add_argument(
         "--user-id",
-        help="User ID for the Context (required for real ingest).",
+        help="User ID for the experiment (required for real ingest).",
+    )
+    parser.add_argument(
+        "--agent-id",
+        default="default",
+        help="Agent ID for the experiment (default: 'default').",
     )
     parser.add_argument(
         "--max-chunks-per-novel",
         type=int,
         default=None,
-        dest="max_chunks_per_novel",
         help=(
             "If set, ingest at most N chunks PER NOVEL. Useful for smoke-testing "
             "before full ingest. Applies to both --dry-run and real ingest."
@@ -275,30 +277,27 @@ async def main():
         if not args.account_id or not args.user_id:
             parser.error("--account-id and --user-id are required when not --dry-run")
 
-    # By this point the env var has either been set by _apply_early_config_env (if --config
-    # was passed) or remains whatever the shell had (dry-run with no --config). Print the
-    # final effective value so the user can see exactly which config will be used.
-    effective_config = os.environ.get(
-        "OPENVIKING_CONFIG_FILE",
-        "(unset, would default to ~/.openviking/ov.conf)",
-    )
     if args.dry_run and not args.config:
-        print(f"[flatten_ingest] (dry-run) OPENVIKING_CONFIG_FILE = {effective_config}")
-    # If args.config was set, _apply_early_config_env already printed the path.
+        env_config = os.environ.get(
+            "OPENVIKING_CONFIG_FILE",
+            "(unset, would default to ~/.openviking/ov.conf)",
+        )
+        print(f"[flatten_ingest] (dry-run) OPENVIKING_CONFIG_FILE = {env_config}")
 
     viking_fs: Optional[Any] = None
     embedding_queue: Optional[Any] = None
     service: Optional[Any] = None
     queue_manager: Optional[Any] = None
     token_tracker: Optional[Any] = None
+    ingest_ctx: Optional[Any] = None
 
     if not args.dry_run:
-        # Imports deferred until inside main() to avoid pulling the live runtime
-        # on dry-run; the config env var is already set above.
-        from openviking.models.embedder.base import _get_token_tracker
-        from openviking.service.core import OpenVikingService
-        from openviking.storage.queuefs.queue_manager import get_queue_manager
-        from openviking.storage.viking_fs import get_viking_fs
+        from openviking.models.embedder.base import _get_token_tracker  # noqa: E402
+        from openviking.server.identity import RequestContext, Role  # noqa: E402
+        from openviking.service.core import OpenVikingService  # noqa: E402
+        from openviking.storage.queuefs.queue_manager import get_queue_manager  # noqa: E402
+        from openviking.storage.viking_fs import get_viking_fs  # noqa: E402
+        from openviking_cli.session.user_id import UserIdentifier  # noqa: E402
 
         print("[flatten_ingest] Initializing OpenVikingService...")
         service = OpenVikingService()
@@ -309,6 +308,17 @@ async def main():
         queue_manager = get_queue_manager()
         embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
         token_tracker = _get_token_tracker()
+
+        user_ident = UserIdentifier(
+            account_id=args.account_id,
+            user_id=args.user_id,
+            agent_id=args.agent_id,
+        )
+        ingest_ctx = RequestContext(user=user_ident, role=Role.ROOT)
+        print(
+            f"[flatten_ingest] Identity: account={args.account_id} "
+            f"user={args.user_id} agent={args.agent_id} role=ROOT"
+        )
 
     stats: Dict[str, NovelStats] = {}
     try:
@@ -336,8 +346,7 @@ async def main():
                 dry_run=False,
                 viking_fs=viking_fs,
                 embedding_queue=embedding_queue,
-                account_id=args.account_id,
-                user_id=args.user_id,
+                ctx=ingest_ctx,
                 max_chunks=args.max_chunks_per_novel,
             )
 
