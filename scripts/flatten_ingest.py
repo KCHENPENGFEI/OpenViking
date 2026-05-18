@@ -49,6 +49,12 @@ Usage:
         --config ~/.openviking/ov-flattern.conf \\
         --account-id ACC --user-id USR \\
         --novels 神雕侠侣 仙逆 诛仙
+
+    # Smoke test (write only 5 chunks per novel, ~15 total):
+    python scripts/flatten_ingest.py \\
+        --config ~/.openviking/ov-flattern.conf \\
+        --account-id ACC --user-id USR \\
+        --max-chunks-per-novel 5
 """
 
 # ====================================================================
@@ -161,6 +167,7 @@ async def ingest_one(
     embedding_queue: Optional[Any] = None,
     account_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    max_chunks: Optional[int] = None,
 ) -> int:
     """Ingest one novel. Returns the number of chunks produced."""
     content = md_path.read_text(encoding="utf-8")
@@ -169,6 +176,8 @@ async def ingest_one(
     for chap in chapters:
         parts = chunk_chapter(content, chap.chapter_idx)
         for i, part in enumerate(parts, 1):
+            if max_chunks is not None and total >= max_chunks:
+                return total
             uri = build_flat_uri(novel, chap.volume, chap.chapter_title, i)
             if dry_run:
                 preview = part.replace("\n", " ")[:80]
@@ -236,6 +245,16 @@ async def main():
         help="User ID for the Context (required for real ingest).",
     )
     parser.add_argument(
+        "--max-chunks-per-novel",
+        type=int,
+        default=None,
+        dest="max_chunks_per_novel",
+        help=(
+            "If set, ingest at most N chunks PER NOVEL. Useful for smoke-testing "
+            "before full ingest. Applies to both --dry-run and real ingest."
+        ),
+    )
+    parser.add_argument(
         "--drain-timeout",
         type=float,
         default=None,
@@ -301,6 +320,7 @@ async def main():
                     novel,
                     md_path,
                     dry_run=True,
+                    max_chunks=args.max_chunks_per_novel,
                 )
                 stats[novel] = NovelStats(chunks=n)
                 print(f"[{novel}] {n} chunks")
@@ -318,6 +338,7 @@ async def main():
                 embedding_queue=embedding_queue,
                 account_id=args.account_id,
                 user_id=args.user_id,
+                max_chunks=args.max_chunks_per_novel,
             )
 
             print(f"[{novel}] {n} chunks enqueued; waiting for EMBEDDING queue to drain...")
