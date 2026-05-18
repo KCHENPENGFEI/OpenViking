@@ -9,17 +9,27 @@ VLM-driven abstract/overview generation is bypassed entirely: the SemanticQueue
 is never enqueued. At retrieval time there are no L0/L1 records, so the
 hierarchical retriever falls back to pure L2 vector matching.
 
+Runtime model:
+    The script bootstraps its own ``OpenVikingService`` (which initializes
+    AGFS / VikingDB / VikingFS / QueueManager and starts queue workers), runs
+    ingest, waits for the EMBEDDING queue to drain, then shuts down cleanly.
+
+    IMPORTANT: stop the OpenViking server before running this script. Both
+    processes opening the same workspace concurrently can cause SQLite queue
+    and AGFS lock conflicts. After ingest completes, start the server (with
+    the same ``--config``) to expose retrieval / chat APIs.
+
 Config selection:
     The script uses the OpenViking config pointed to by ``--config`` (required
-    for non-dry-run) by setting ``OPENVIKING_CONFIG_FILE`` before any openviking
-    import. This prevents accidentally writing to the baseline workspace when
-    the env var is missing in the shell.
+    for non-dry-run) by setting ``OPENVIKING_CONFIG_FILE`` before any
+    openviking import. This prevents accidentally writing to the baseline
+    workspace when the env var is missing in the shell.
 
 Usage:
-    # Preview only (config optional):
+    # Preview only (config optional, no service bootstrap):
     python scripts/flatten_ingest.py --dry-run
 
-    # Real ingest (config required):
+    # Real ingest (server MUST be stopped):
     python scripts/flatten_ingest.py \\
         --config ~/.openviking/ov-flattern.conf \\
         --account-id ACC --user-id USR \\
@@ -139,6 +149,15 @@ async def main():
         "--user-id",
         help="User ID for the Context (required for real ingest).",
     )
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds to wait for the EMBEDDING queue to drain after enqueue "
+            "(default: unbounded). Only used for non-dry-run."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.dry_run:
@@ -158,39 +177,62 @@ async def main():
         os.environ["OPENVIKING_CONFIG_FILE"] = resolved
         print(f"[flatten_ingest] OPENVIKING_CONFIG_FILE = {resolved}")
     else:
-        # dry-run with no --config: report whatever the env / default would resolve to
         env_config = os.environ.get(
-            "OPENVIKING_CONFIG_FILE", "(unset, would default to ~/.openviking/ov.conf)"
+            "OPENVIKING_CONFIG_FILE",
+            "(unset, would default to ~/.openviking/ov.conf)",
         )
         print(f"[flatten_ingest] (dry-run) OPENVIKING_CONFIG_FILE = {env_config}")
 
     viking_fs: Optional[Any] = None
     embedding_queue: Optional[Any] = None
+    service: Optional[Any] = None
+    queue_manager: Optional[Any] = None
 
     if not args.dry_run:
-        # Imports deferred until after env var is set so the singleton picks up
-        # the correct config file.
+        # Imports deferred until after env var is set so the config singleton
+        # picks up the correct config file.
+        from openviking.service.core import OpenVikingService
         from openviking.storage.queuefs.queue_manager import get_queue_manager
         from openviking.storage.viking_fs import get_viking_fs
 
-        viking_fs = get_viking_fs()
-        embedding_queue = get_queue_manager().get_queue("EMBEDDING")
+        print("[flatten_ingest] Initializing OpenVikingService...")
+        service = OpenVikingService()
+        await service.initialize()
+        print("[flatten_ingest] OpenVikingService ready; embedding worker started.")
 
-    grand_total = 0
-    for novel in args.novels:
-        md_path = Path(NOVEL_MAP[novel])
-        n = await ingest_one(
-            novel,
-            md_path,
-            args.dry_run,
-            viking_fs=viking_fs,
-            embedding_queue=embedding_queue,
-            account_id=args.account_id,
-            user_id=args.user_id,
-        )
-        print(f"[{novel}] {n} chunks")
-        grand_total += n
-    print(f"TOTAL: {grand_total} chunks")
+        viking_fs = get_viking_fs()
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue("EMBEDDING")
+
+    try:
+        grand_total = 0
+        for novel in args.novels:
+            md_path = Path(NOVEL_MAP[novel])
+            n = await ingest_one(
+                novel,
+                md_path,
+                args.dry_run,
+                viking_fs=viking_fs,
+                embedding_queue=embedding_queue,
+                account_id=args.account_id,
+                user_id=args.user_id,
+            )
+            print(f"[{novel}] {n} chunks")
+            grand_total += n
+        print(f"TOTAL: {grand_total} chunks enqueued")
+
+        if not args.dry_run and queue_manager is not None:
+            print("[flatten_ingest] Waiting for EMBEDDING queue to drain...")
+            await queue_manager.wait_complete(
+                queue_name="EMBEDDING",
+                timeout=args.drain_timeout,
+            )
+            print("[flatten_ingest] EMBEDDING queue drained.")
+    finally:
+        if service is not None:
+            print("[flatten_ingest] Closing OpenVikingService...")
+            await service.close()
+            print("[flatten_ingest] Done.")
 
 
 if __name__ == "__main__":
