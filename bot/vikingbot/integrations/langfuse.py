@@ -1,5 +1,6 @@
 """Langfuse integration for LLM observability."""
 
+import os
 from contextlib import contextmanager
 from typing import Any, Generator
 
@@ -126,7 +127,16 @@ class LangfuseClient:
         outcome_label: str,
         outcome_payload: dict[str, Any] | None = None,
     ) -> None:
-        """Attach evaluated response outcome metadata to a tracked generation."""
+        """Attach evaluated response outcome metadata to a tracked generation.
+
+        Set env var ``OV_DISABLE_RESPONSE_OUTCOME=1`` to short-circuit this method
+        for latency-sensitive experiments (chat_eval, throughput benchmarks). The
+        upstream computation (``evaluate_response_outcome``) still runs but the
+        two Langfuse calls (create_event + create_score) plus flush() are skipped.
+        Regular generation traces (input/output) are unaffected.
+        """
+        if os.environ.get("OV_DISABLE_RESPONSE_OUTCOME", "").lower() in ("1", "true", "yes"):
+            return
         if not self.enabled or not response_id:
             return
 
