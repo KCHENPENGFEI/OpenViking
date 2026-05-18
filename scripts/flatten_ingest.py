@@ -9,18 +9,26 @@ VLM-driven abstract/overview generation is bypassed entirely: the SemanticQueue
 is never enqueued. At retrieval time there are no L0/L1 records, so the
 hierarchical retriever falls back to pure L2 vector matching.
 
+Config selection:
+    The script uses the OpenViking config pointed to by ``--config`` (required
+    for non-dry-run) by setting ``OPENVIKING_CONFIG_FILE`` before any openviking
+    import. This prevents accidentally writing to the baseline workspace when
+    the env var is missing in the shell.
+
 Usage:
-    # Preview only:
+    # Preview only (config optional):
     python scripts/flatten_ingest.py --dry-run
 
-    # Real ingest (requires server running with ov-flattern.conf):
-    python scripts/flatten_ingest.py \
-        --account-id ACC --user-id USR \
+    # Real ingest (config required):
+    python scripts/flatten_ingest.py \\
+        --config ~/.openviking/ov-flattern.conf \\
+        --account-id ACC --user-id USR \\
         --novels 神雕侠侣 仙逆 诛仙
 """
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,9 +51,10 @@ async def _real_ingest_chunk(
     account_id: str,
     user_id: str,
 ) -> None:
-    """Write one chunk to AGFS and enqueue its embedding."""
-    # Local imports so that unit tests that mock both args don't need the live
-    # OpenViking runtime imported at module-load time.
+    """Write one chunk to AGFS and enqueue its embedding.
+
+    Imports are deferred to keep unit-test setup lightweight.
+    """
     from openviking.core.context import Context, ContextLevel, Vectorize
     from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 
@@ -99,6 +108,11 @@ async def ingest_one(
     return total
 
 
+def _resolve_config_path(raw: str) -> str:
+    """Expand ``~`` and return an absolute path."""
+    return os.path.abspath(os.path.expanduser(raw))
+
+
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -110,6 +124,14 @@ async def main():
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview only; do not write.")
     parser.add_argument(
+        "--config",
+        help=(
+            "Path to OpenViking config file (e.g. ~/.openviking/ov-flattern.conf). "
+            "REQUIRED for non-dry-run to prevent accidental writes to the baseline "
+            "workspace. Optional for --dry-run."
+        ),
+    )
+    parser.add_argument(
         "--account-id",
         help="Account ID for the Context (required for real ingest).",
     )
@@ -119,12 +141,35 @@ async def main():
     )
     args = parser.parse_args()
 
+    if not args.dry_run:
+        if not args.config:
+            parser.error(
+                "--config is REQUIRED for non-dry-run ingest. "
+                "Pass --config ~/.openviking/ov-flattern.conf (or your experiment config) "
+                "to avoid writing into the baseline workspace by mistake."
+            )
+        if not args.account_id or not args.user_id:
+            parser.error("--account-id and --user-id are required when not --dry-run")
+
+    if args.config:
+        resolved = _resolve_config_path(args.config)
+        if not os.path.isfile(resolved):
+            parser.error(f"--config path does not exist: {resolved}")
+        os.environ["OPENVIKING_CONFIG_FILE"] = resolved
+        print(f"[flatten_ingest] OPENVIKING_CONFIG_FILE = {resolved}")
+    else:
+        # dry-run with no --config: report whatever the env / default would resolve to
+        env_config = os.environ.get(
+            "OPENVIKING_CONFIG_FILE", "(unset, would default to ~/.openviking/ov.conf)"
+        )
+        print(f"[flatten_ingest] (dry-run) OPENVIKING_CONFIG_FILE = {env_config}")
+
     viking_fs: Optional[Any] = None
     embedding_queue: Optional[Any] = None
 
     if not args.dry_run:
-        if not args.account_id or not args.user_id:
-            parser.error("--account-id and --user-id are required when not --dry-run")
+        # Imports deferred until after env var is set so the singleton picks up
+        # the correct config file.
         from openviking.storage.queuefs.queue_manager import get_queue_manager
         from openviking.storage.viking_fs import get_viking_fs
 
