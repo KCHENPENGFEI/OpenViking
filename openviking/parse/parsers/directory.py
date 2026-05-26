@@ -443,6 +443,11 @@ class DirectoryParser(BaseParser):
         """Check whether an AGFS ``ls`` entry represents a directory."""
         return bool(entry.get("isDir", False)) or entry.get("type") == "directory"
 
+    # viking_fs.ls defaults node_limit=1000, which silently truncates large
+    # parser outputs (e.g. a markdown split into >1000 chapters) and orphans
+    # the rest in temp before delete_temp drops them. Force-list everything.
+    _LS_ALL = 2**31 - 1
+
     @staticmethod
     async def _merge_temp(
         viking_fs: Any,
@@ -453,7 +458,7 @@ class DirectoryParser(BaseParser):
 
         After the move the source temp is deleted.
         """
-        entries = await viking_fs.ls(src_temp_uri)
+        entries = await viking_fs.ls(src_temp_uri, node_limit=DirectoryParser._LS_ALL)
         for entry in entries:
             name = entry.get("name", "")
             if not name or name in (".", ".."):
@@ -522,7 +527,7 @@ class DirectoryParser(BaseParser):
     ) -> None:
         """Recursively move a VikingFS directory tree."""
         await viking_fs.mkdir(dst_uri, exist_ok=True)
-        entries = await viking_fs.ls(src_uri)
+        entries = await viking_fs.ls(src_uri, node_limit=DirectoryParser._LS_ALL)
         for entry in entries:
             name = entry.get("name", "")
             if not name or name in (".", ".."):
