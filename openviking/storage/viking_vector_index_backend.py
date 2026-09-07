@@ -1714,7 +1714,8 @@ class VikingVectorIndexBackend:
         scopes: List[FilterExpr] = [Eq("uri", uri)]
         if recursive:
             scopes.append(PathScope("uri", uri, depth=-1))
-        if self.mode == "volcengine":
+        # Both VikingDB deployments require path-index queries for URI chunks.
+        if self.mode in {"volcengine", "vikingdb"}:
             parent = VikingURI(uri).parent
             if parent is not None and parent.uri != "viking://":
                 scopes.append(PathScope("uri", parent.uri, depth=1))
@@ -1739,7 +1740,7 @@ class VikingVectorIndexBackend:
                 return [], 0
             filters: List[FilterExpr] = []
             for entry in sorted(selected_entries):
-                if self.mode == "volcengine":
+                if self.mode in {"volcengine", "vikingdb"}:
                     filters.append(self._uri_transfer_filter(ctx, entry, recursive=False))
                 else:
                     # Raw prefix filters encode URI values to the stored path format.
