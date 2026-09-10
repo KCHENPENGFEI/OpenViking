@@ -392,7 +392,6 @@ class UnderstandingAPI(BaseParser):
     def _auth_headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
-            "x-kb-env": "snake",
         }
         if extra:
             headers.update(extra)
